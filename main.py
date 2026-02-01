@@ -1,66 +1,46 @@
 import os
-import json
-from typing import Optional, Literal, List, Dict, Any
+from typing import Optional, Literal, Dict, Any
 
 import jwt
-from jwt import InvalidTokenError
+from jwt import InvalidTokenError, PyJWKClient
 from fastapi import FastAPI, Depends, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg import connect
 from psycopg.rows import dict_row
 
+# --------------------------
+# ENV
+# --------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
+SUPABASE_PROJECT_URL = os.getenv("SUPABASE_PROJECT_URL", "").rstrip("/")
 ENV = os.getenv("ENV", "prod")
 
 AppRole = Literal["SALARIE", "CHEF_CHANTIER", "RESPONSABLE"]
 
 app = FastAPI(title="Planning API (MVP)")
 
-# CORS: au début on autorise tout. Après tu mettras ton domaine Cloudflare Pages.
+# CORS: au début on laisse "*". Plus tard, restreins à ton domaine Cloudflare Pages.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"] if ENV != "prod" else ["*"],
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
 # --------------------------
-# Utils DB
+# DB helper
 # --------------------------
 def db_conn():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL missing")
+        raise RuntimeError("DATABASE_URL missing (set it in Render env vars)")
     return connect(DATABASE_URL, row_factory=dict_row)
 
 
 # --------------------------
-# Auth: vérification JWT Supabase
+# Auth helpers
 # --------------------------
-def decode_supabase_jwt(token: str) -> Dict[str, Any]:
-    """
-    Token = access_token retourné par Supabase Auth.
-    On vérifie la signature HS256 avec SUPABASE_JWT_SECRET.
-    """
-    if not SUPABASE_JWT_SECRET:
-        raise RuntimeError("SUPABASE_JWT_SECRET missing")
-
-    try:
-        payload = jwt.decode(
-            token,
-            SUPABASE_JWT_SECRET,
-            algorithms=["HS256"],
-            options={
-                "verify_aud": False,  # on ne force pas l'audience pour MVP
-            },
-        )
-        return payload
-    except InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-
-
 def get_bearer_token(authorization: Optional[str] = Header(None)) -> str:
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -68,6 +48,53 @@ def get_bearer_token(authorization: Optional[str] = Header(None)) -> str:
     if len(parts) != 2 or parts[0].lower() != "bearer":
         raise HTTPException(status_code=401, detail="Authorization must be: Bearer <token>")
     return parts[1].strip()
+
+
+def decode_supabase_jwt(token: str) -> Dict[str, Any]:
+    """
+    Supporte HS256 (JWT Secret) ET RS256 (JWKS Supabase).
+    - Si le token est HS256 -> vérifie avec SUPABASE_JWT_SECRET
+    - Si le token est RS256 -> vérifie avec la clé publique via JWKS
+    """
+    try:
+        header = jwt.get_unverified_header(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token header")
+
+    alg = header.get("alg")
+
+    # Case 1: HS256
+    if alg == "HS256":
+        if not SUPABASE_JWT_SECRET:
+            raise RuntimeError("SUPABASE_JWT_SECRET missing (Render env var)")
+        try:
+            return jwt.decode(
+                token,
+                SUPABASE_JWT_SECRET,
+                algorithms=["HS256"],
+                options={"verify_aud": False},
+            )
+        except InvalidTokenError:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    # Case 2: RS256 via JWKS
+    if alg == "RS256":
+        if not SUPABASE_PROJECT_URL:
+            raise RuntimeError("SUPABASE_PROJECT_URL missing (Render env var)")
+        jwks_url = f"{SUPABASE_PROJECT_URL}/auth/v1/.well-known/jwks.json"
+        try:
+            jwk_client = PyJWKClient(jwks_url)
+            signing_key = jwk_client.get_signing_key_from_jwt(token).key
+            return jwt.decode(
+                token,
+                signing_key,
+                algorithms=["RS256"],
+                options={"verify_aud": False},
+            )
+        except Exception:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    raise HTTPException(status_code=401, detail=f"Unsupported JWT alg: {alg}")
 
 
 def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[str, Any]:
@@ -118,8 +145,13 @@ def require_roles(*allowed: AppRole):
 
 
 # --------------------------
-# Health
+# ROUTES
 # --------------------------
+@app.get("/")
+def root():
+    return {"service": "planning-api", "status": "ok", "docs": "/docs"}
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -127,9 +159,9 @@ def health():
 
 # --------------------------
 # Employees
-# - SALARIE: read only self
-# - CHEF_CHANTIER: read all
-# - RESPONSABLE: read/write all
+# SALARIE: read self only
+# CHEF_CHANTIER: read all
+# RESPONSABLE: read/write all
 # --------------------------
 @app.get("/employees")
 def list_employees(user=Depends(get_current_user)):
@@ -149,7 +181,7 @@ def list_employees(user=Depends(get_current_user)):
                 cur.execute("""
                   select id::text, first_name, last_name, email, phone, is_active
                   from public.employees
-                  where id = %s
+                  where id = %s::uuid
                 """, (user["employee_id"],))
                 row = cur.fetchone()
                 return [row] if row else []
@@ -181,9 +213,9 @@ def create_employee(payload: Dict[str, Any], user=Depends(require_roles("RESPONS
 
 # --------------------------
 # Assignments
-# - SALARIE: read only self
-# - CHEF_CHANTIER: read all, create/update BROUILLON/SOUMIS
-# - RESPONSABLE: all + can set VALIDE/REFUSE
+# SALARIE: read self only
+# CHEF_CHANTIER: read all, create/update BROUILLON/SOUMIS
+# RESPONSABLE: all + can set VALIDE/REFUSE
 # --------------------------
 @app.get("/assignments")
 def list_assignments(
@@ -196,7 +228,7 @@ def list_assignments(
     params = []
 
     if activity:
-        where.append("a.activity = %s")
+        where.append("a.activity = %s::activity_type")
         params.append(activity)
     if date_from:
         where.append("a.assign_date >= %s::date")
@@ -238,13 +270,11 @@ def list_assignments(
 
 @app.post("/assignments")
 def create_assignment(payload: Dict[str, Any], user=Depends(require_roles("CHEF_CHANTIER", "RESPONSABLE"))):
-    # Champs requis
     required = ["employee_id", "activity", "assign_date", "role", "shift", "status"]
     for k in required:
         if k not in payload:
             raise HTTPException(status_code=400, detail=f"Missing field: {k}")
 
-    # Chef: seulement BROUILLON/SOUMIS
     if user["role"] == "CHEF_CHANTIER" and payload["status"] not in ("BROUILLON", "SOUMIS"):
         raise HTTPException(status_code=403, detail="Chef can only create BROUILLON/SOUMIS assignments")
 
@@ -272,31 +302,27 @@ def create_assignment(payload: Dict[str, Any], user=Depends(require_roles("CHEF_
                 conn.commit()
                 return {"id": new_id}
             except Exception as e:
-                # unique index 1 assignment/day -> erreur ici si conflit
                 raise HTTPException(status_code=400, detail=f"Insert failed: {str(e)}")
 
 
 @app.patch("/assignments/{assignment_id}")
 def update_assignment(assignment_id: str, payload: Dict[str, Any], user=Depends(require_roles("CHEF_CHANTIER", "RESPONSABLE"))):
-    # On lit le status actuel
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("select status::text from public.assignments where id = %s::uuid", (assignment_id,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Assignment not found")
+
             current_status = row["status"]
 
-            # Chef ne peut modifier que si BROUILLON/SOUMIS
             if user["role"] == "CHEF_CHANTIER" and current_status not in ("BROUILLON", "SOUMIS"):
                 raise HTTPException(status_code=403, detail="Chef cannot edit after validation/refusal")
 
-            # Chef ne peut pas setter VALIDE/REFUSE
             if user["role"] == "CHEF_CHANTIER" and "status" in payload and payload["status"] in ("VALIDE", "REFUSE"):
                 raise HTTPException(status_code=403, detail="Chef cannot validate/refuse")
 
-            # Build update dynamically
-            allowed_fields = {"activity","assign_date","role","shift","is_pf","status"}
+            allowed_fields = {"activity", "assign_date", "role", "shift", "is_pf", "status"}
             sets = []
             params = []
             for k, v in payload.items():
@@ -325,9 +351,10 @@ def update_assignment(assignment_id: str, payload: Dict[str, Any], user=Depends(
 
 
 # --------------------------
-# Unavailabilities (congé/RTT/maladie/formation/roulage)
-# - SALARIE: create/update only self in BROUILLON/SOUMIS
-# - RESPONSABLE: all
+# Unavailabilities
+# SALARIE: create/update only self in BROUILLON/SOUMIS
+# RESPONSABLE: all
+# CHEF_CHANTIER: blocked in MVP
 # --------------------------
 @app.get("/unavailabilities")
 def list_unavail(
@@ -369,19 +396,17 @@ def list_unavail(
 
 @app.post("/unavailabilities")
 def create_unavail(payload: Dict[str, Any], user=Depends(get_current_user)):
-    required = ["employee_id","type","start_date","end_date","impact","status"]
+    required = ["employee_id", "type", "start_date", "end_date", "impact", "status"]
     for k in required:
         if k not in payload:
             raise HTTPException(status_code=400, detail=f"Missing field: {k}")
 
-    # SALARIE: seulement sur lui-même + BROUILLON/SOUMIS
     if user["role"] == "SALARIE":
         if not user["employee_id"] or payload["employee_id"] != user["employee_id"]:
             raise HTTPException(status_code=403, detail="SALARIE can only create for self")
-        if payload["status"] not in ("BROUILLON","SOUMIS"):
+        if payload["status"] not in ("BROUILLON", "SOUMIS"):
             raise HTTPException(status_code=403, detail="SALARIE can only create BROUILLON/SOUMIS")
 
-    # CHEF_CHANTIER: on bloque (MVP) => il ne crée pas d'indispo, seulement admin + salarié
     if user["role"] == "CHEF_CHANTIER":
         raise HTTPException(status_code=403, detail="CHEF_CHANTIER cannot create unavailabilities (MVP)")
 
@@ -411,17 +436,20 @@ def create_unavail(payload: Dict[str, Any], user=Depends(get_current_user)):
 
 
 # --------------------------
-# Alerts
-# (lecture des vues)
+# Alerts (views)
 # --------------------------
 @app.get("/alerts/coverage/daily")
-def alerts_coverage_daily(activity: str = "ME1", limit: int = 60, user=Depends(require_roles("CHEF_CHANTIER","RESPONSABLE"))):
+def alerts_coverage_daily(
+    activity: str = "ME1",
+    limit: int = 60,
+    user=Depends(require_roles("CHEF_CHANTIER", "RESPONSABLE")),
+):
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
               select activity::text, day_date::text, mode::text, missing_total, missing_items
               from public.v_coverage_alerts_daily_summary
-              where activity = %s
+              where activity = %s::activity_type
               order by day_date
               limit %s
             """, (activity, limit))
@@ -429,7 +457,7 @@ def alerts_coverage_daily(activity: str = "ME1", limit: int = 60, user=Depends(r
 
 
 @app.get("/alerts/medical")
-def alerts_medical(limit: int = 200, user=Depends(require_roles("CHEF_CHANTIER","RESPONSABLE"))):
+def alerts_medical(limit: int = 200, user=Depends(require_roles("CHEF_CHANTIER", "RESPONSABLE"))):
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -441,6 +469,3 @@ def alerts_medical(limit: int = 200, user=Depends(require_roles("CHEF_CHANTIER",
               limit %s
             """, (limit,))
             return cur.fetchall()
-@app.get("/")
-def root():
-    return {"service": "planning-api", "status": "ok", "docs": "/docs"}

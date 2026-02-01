@@ -21,13 +21,20 @@ AppRole = Literal["SALARIE", "CHEF_CHANTIER", "RESPONSABLE"]
 app = FastAPI(title="Planning API (MVP)")
 
 # CORS: au début on laisse "*". Plus tard, restreins à ton domaine Cloudflare Pages.
+from fastapi.responses import Response
+
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "").strip()
+
+origins = ["*"] if not FRONTEND_ORIGIN else [FRONTEND_ORIGIN]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "apikey"],
 )
+
 
 # --------------------------
 # DB helper

@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Planning Mercure - Test</title>
+  <style>
+    body{font-family:system-ui;margin:16px}
+    input,button{width:100%;padding:12px;margin:6px 0}
+    pre{background:#111;color:#eee;padding:12px;overflow:auto}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    @media(max-width:720px){.row{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <h2>Test Login Supabase → API Render</h2>
+
+  <h3>Login</h3>
+  <input id="email" placeholder="Email">
+  <input id="password" type="password" placeholder="Mot de passe">
+  <div class="row">
+    <button id="login">Se connecter</button>
+    <button id="logout">Se déconnecter</button>
+  </div>
+
+  <h3>Résultat</h3>
+  <button id="employees">GET /employees</button>
+  <pre id="out">(vide)</pre>
+
+<script type="module">
+  import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm";
+
+  const SUPABASE_URL = "https://hgishjwhpvfxsmvtjgbf.supabase.co";
+  const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhnaXNoandocHZmeHNtdnRqZ2JmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk2MzA5NTYsImV4cCI6MjA4NTIwNjk1Nn0.3BZiQRWivik3h8S9CyHIff3e2F7M0Oudw5rP7dN5-Zw";
+  const API_BASE = "https://backend-esoa.onrender.com";
+
+  const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+  const out = document.getElementById("out");
+
+  async function getToken(){
+    const { data } = await supabase.auth.getSession();
+    return data?.session?.access_token || null;
+  }
+
+  document.getElementById("login").onclick = async () => {
+    out.textContent = "Connexion...";
+    const email = document.getElementById("email").value.trim();
+    const password = document.getElementById("password").value;
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    out.textContent = error ? ("❌ " + error.message) : "✅ Connecté";
+  };
+
+  document.getElementById("logout").onclick = async () => {
+    await supabase.auth.signOut();
+    out.textContent = "Déconnecté";
+  };
+
+  document.getElementById("employees").onclick = async () => {
+    out.textContent = "Appel /employees...";
+    const token = await getToken();
+    if(!token){
+      out.textContent = "❌ Pas de session (connecte-toi d'abord)";
+      return;
+    }
+    const res = await fetch(API_BASE + "/employees", {
+      headers: { Authorization: "Bearer " + token }
+    });
+    const text = await res.text();
+    out.textContent = res.status + "\n" + text;
+  };
+</script>
+</body>
+</html>

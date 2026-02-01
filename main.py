@@ -9,8 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from psycopg import connect
 from psycopg.rows import dict_row
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:5HeY6LhFHx9aqxwX@db.hgishjwhpvfxsmvtjgbf.supabase.co:5432/postgres")
-SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "hb+dVcUH1Qk5e6W5d3WSNMqmqALEy41WONR3jJ2kAE3MYa1TTVtVVCRTAPUTgcRnFzlqQc1iO6nBtW3Aj3Wivw==")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
 ENV = os.getenv("ENV", "prod")
 
 AppRole = Literal["SALARIE", "CHEF_CHANTIER", "RESPONSABLE"]

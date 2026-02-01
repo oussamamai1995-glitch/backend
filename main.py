@@ -52,9 +52,10 @@ def get_bearer_token(authorization: Optional[str] = Header(None)) -> str:
 
 def decode_supabase_jwt(token: str) -> Dict[str, Any]:
     """
-    Supporte HS256 (JWT Secret) ET RS256 (JWKS Supabase).
-    - Si le token est HS256 -> vérifie avec SUPABASE_JWT_SECRET
-    - Si le token est RS256 -> vérifie avec la clé publique via JWKS
+    Supporte:
+      - HS256 (secret)
+      - RS256 (JWKS)
+      - ES256 (JWKS)  <-- ton cas
     """
     try:
         header = jwt.get_unverified_header(token)
@@ -63,7 +64,7 @@ def decode_supabase_jwt(token: str) -> Dict[str, Any]:
 
     alg = header.get("alg")
 
-    # Case 1: HS256
+    # HS256: vérification via secret
     if alg == "HS256":
         if not SUPABASE_JWT_SECRET:
             raise RuntimeError("SUPABASE_JWT_SECRET missing (Render env var)")
@@ -77,8 +78,8 @@ def decode_supabase_jwt(token: str) -> Dict[str, Any]:
         except InvalidTokenError:
             raise HTTPException(status_code=401, detail="Invalid or expired token")
 
-    # Case 2: RS256 via JWKS
-    if alg == "RS256":
+    # RS256 / ES256: vérification via JWKS (clé publique Supabase)
+    if alg in ("RS256", "ES256"):
         if not SUPABASE_PROJECT_URL:
             raise RuntimeError("SUPABASE_PROJECT_URL missing (Render env var)")
         jwks_url = f"{SUPABASE_PROJECT_URL}/auth/v1/.well-known/jwks.json"
@@ -88,7 +89,7 @@ def decode_supabase_jwt(token: str) -> Dict[str, Any]:
             return jwt.decode(
                 token,
                 signing_key,
-                algorithms=["RS256"],
+                algorithms=[alg],
                 options={"verify_aud": False},
             )
         except Exception:
@@ -159,9 +160,6 @@ def health():
 
 # --------------------------
 # Employees
-# SALARIE: read self only
-# CHEF_CHANTIER: read all
-# RESPONSABLE: read/write all
 # --------------------------
 @app.get("/employees")
 def list_employees(user=Depends(get_current_user)):
@@ -213,9 +211,6 @@ def create_employee(payload: Dict[str, Any], user=Depends(require_roles("RESPONS
 
 # --------------------------
 # Assignments
-# SALARIE: read self only
-# CHEF_CHANTIER: read all, create/update BROUILLON/SOUMIS
-# RESPONSABLE: all + can set VALIDE/REFUSE
 # --------------------------
 @app.get("/assignments")
 def list_assignments(
@@ -305,138 +300,8 @@ def create_assignment(payload: Dict[str, Any], user=Depends(require_roles("CHEF_
                 raise HTTPException(status_code=400, detail=f"Insert failed: {str(e)}")
 
 
-@app.patch("/assignments/{assignment_id}")
-def update_assignment(assignment_id: str, payload: Dict[str, Any], user=Depends(require_roles("CHEF_CHANTIER", "RESPONSABLE"))):
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("select status::text from public.assignments where id = %s::uuid", (assignment_id,))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="Assignment not found")
-
-            current_status = row["status"]
-
-            if user["role"] == "CHEF_CHANTIER" and current_status not in ("BROUILLON", "SOUMIS"):
-                raise HTTPException(status_code=403, detail="Chef cannot edit after validation/refusal")
-
-            if user["role"] == "CHEF_CHANTIER" and "status" in payload and payload["status"] in ("VALIDE", "REFUSE"):
-                raise HTTPException(status_code=403, detail="Chef cannot validate/refuse")
-
-            allowed_fields = {"activity", "assign_date", "role", "shift", "is_pf", "status"}
-            sets = []
-            params = []
-            for k, v in payload.items():
-                if k not in allowed_fields:
-                    continue
-                if k == "activity":
-                    sets.append("activity = %s::activity_type"); params.append(v)
-                elif k == "assign_date":
-                    sets.append("assign_date = %s::date"); params.append(v)
-                elif k == "role":
-                    sets.append("role = %s::role_code"); params.append(v)
-                elif k == "shift":
-                    sets.append("shift = %s::shift_code"); params.append(v)
-                elif k == "is_pf":
-                    sets.append("is_pf = %s::boolean"); params.append(bool(v))
-                elif k == "status":
-                    sets.append("status = %s::request_status"); params.append(v)
-
-            if not sets:
-                return {"ok": True, "updated": 0}
-
-            params.append(assignment_id)
-            cur.execute(f"update public.assignments set {', '.join(sets)} where id = %s::uuid", tuple(params))
-            conn.commit()
-            return {"ok": True, "updated": cur.rowcount}
-
-
 # --------------------------
-# Unavailabilities
-# SALARIE: create/update only self in BROUILLON/SOUMIS
-# RESPONSABLE: all
-# CHEF_CHANTIER: blocked in MVP
-# --------------------------
-@app.get("/unavailabilities")
-def list_unavail(
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    user=Depends(get_current_user),
-):
-    where = []
-    params = []
-    if date_from:
-        where.append("u.start_date >= %s::date"); params.append(date_from)
-    if date_to:
-        where.append("u.end_date <= %s::date"); params.append(date_to)
-
-    if user["role"] == "SALARIE":
-        if not user["employee_id"]:
-            return []
-        where.append("u.employee_id = %s::uuid"); params.append(user["employee_id"])
-
-    sql = """
-      select
-        u.id::text, u.employee_id::text, e.first_name, e.last_name,
-        u.type::text, u.impact::text,
-        u.start_date::text, u.end_date::text,
-        u.start_time::text, u.end_time::text,
-        u.status::text
-      from public.unavailabilities u
-      join public.employees e on e.id = u.employee_id
-    """
-    if where:
-        sql += " where " + " and ".join(where)
-    sql += " order by u.start_date"
-
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, tuple(params))
-            return cur.fetchall()
-
-
-@app.post("/unavailabilities")
-def create_unavail(payload: Dict[str, Any], user=Depends(get_current_user)):
-    required = ["employee_id", "type", "start_date", "end_date", "impact", "status"]
-    for k in required:
-        if k not in payload:
-            raise HTTPException(status_code=400, detail=f"Missing field: {k}")
-
-    if user["role"] == "SALARIE":
-        if not user["employee_id"] or payload["employee_id"] != user["employee_id"]:
-            raise HTTPException(status_code=403, detail="SALARIE can only create for self")
-        if payload["status"] not in ("BROUILLON", "SOUMIS"):
-            raise HTTPException(status_code=403, detail="SALARIE can only create BROUILLON/SOUMIS")
-
-    if user["role"] == "CHEF_CHANTIER":
-        raise HTTPException(status_code=403, detail="CHEF_CHANTIER cannot create unavailabilities (MVP)")
-
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-              insert into public.unavailabilities(
-                employee_id, type, start_date, end_date, start_time, end_time, impact, status, requested_by
-              )
-              values (%s::uuid, %s::unavailability_type, %s::date, %s::date,
-                      %s::time, %s::time, %s::availability_impact, %s::request_status, %s::uuid)
-              returning id::text
-            """, (
-                payload["employee_id"],
-                payload["type"],
-                payload["start_date"],
-                payload["end_date"],
-                payload.get("start_time"),
-                payload.get("end_time"),
-                payload["impact"],
-                payload["status"],
-                user["user_id"],
-            ))
-            new_id = cur.fetchone()["id"]
-            conn.commit()
-            return {"id": new_id}
-
-
-# --------------------------
-# Alerts (views)
+# Alerts
 # --------------------------
 @app.get("/alerts/coverage/daily")
 def alerts_coverage_daily(
@@ -453,19 +318,4 @@ def alerts_coverage_daily(
               order by day_date
               limit %s
             """, (activity, limit))
-            return cur.fetchall()
-
-
-@app.get("/alerts/medical")
-def alerts_medical(limit: int = 200, user=Depends(require_roles("CHEF_CHANTIER", "RESPONSABLE"))):
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-              select employee_id::text, first_name, last_name, visit_type_code, visit_type_label,
-                     visit_date::text, expires_on::text, alert_level
-              from public.v_medical_visit_alerts
-              where alert_level in ('EXPIRE','J_30','J_60')
-              order by expires_on nulls last
-              limit %s
-            """, (limit,))
             return cur.fetchall()

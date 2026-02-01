@@ -441,3 +441,6 @@ def alerts_medical(limit: int = 200, user=Depends(require_roles("CHEF_CHANTIER",
               limit %s
             """, (limit,))
             return cur.fetchall()
+@app.get("/")
+def root():
+    return {"service": "planning-api", "status": "ok", "docs": "/docs"}
